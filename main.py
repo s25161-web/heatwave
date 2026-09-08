@@ -1,125 +1,150 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import numpy as np
+import folium
+from streamlit_folium import st_folium
+import requests
+import io
+import copy
 
-st.set_page_config(page_title="편의점 & 카페 지도 시각화", layout="wide")
-st.title("\U0001f4cd 편의점 & 카페 분포 지도 (반경 검색 포함)")
+st.set_page_config(page_title="전국 폭염일수 대시보드", page_icon="\u2600\ufe0f", layout="wide")
+st.title("\u2600\ufe0f 대한민국 폭염 종합 분석 대시보드")
+st.caption("기상청 관측망 데이터를 바탕으로 한 전국 폭염일수 지도 및 연도별 주요 폭염 기록 통계입니다.")
 
-# 실제 CSV(store.csv) 열 이름 및 값 매핑 — 다운로드한 파일에 맞게 조정하세요
-STORE_NAME_COL = "상호명"
-LAT_COL = "위도"
-LON_COL = "경도"
-CATEGORY_COL = "상권업종소분류명"
-SIDO_COL = "시도명"
-
-NAME_CONVENIENCE = "편의점"
-NAME_CAFE = "카페"
+GEOJSON_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
 
 @st.cache_data
-def load_data():
+def load_geojson(url):
+    response = requests.get(url)
+    return response.json()
+
+@st.cache_data
+def load_all_heatwave_data():
+    """하나의 heatwave.csv에서 3개 섹션의 데이터를 각각 읽어옵니다."""
     try:
-        df = pd.read_csv("store.csv")
-    except FileNotFoundError:
-        df = pd.read_csv("store_filtered.csv")
+        with open("heatwave.csv", "r", encoding="cp949") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        with open("heatwave.csv", "r", encoding="utf-8") as f:
+            lines = f.readlines()
 
-    filtered_df = df[df[CATEGORY_COL].isin([NAME_CONVENIENCE, NAME_CAFE])].copy()
+    longest_idx = extreme_idx = points_idx = None
+    for idx, line in enumerate(lines):
+        clean_l = line.strip()
+        if clean_l == "가장 긴 폭염":
+            longest_idx = idx + 1
+        elif clean_l == "가장 빠른/가장 늦은 폭염":
+            extreme_idx = idx + 1
+        elif clean_l == "전국 폭염일수":
+            points_idx = idx + 2
 
-    filtered_df[LAT_COL] = pd.to_numeric(filtered_df[LAT_COL], errors="coerce")
-    filtered_df[LON_COL] = pd.to_numeric(filtered_df[LON_COL], errors="coerce")
-    filtered_df = filtered_df.dropna(subset=[LAT_COL, LON_COL])
-    return filtered_df
+    longest_lines = []
+    for l in lines[longest_idx:]:
+        if not l.strip() or "가장 빠른" in l:
+            break
+        longest_lines.append(l)
+    df_longest = pd.read_csv(io.StringIO("".join(longest_lines)))
+    df_longest.columns = [c.strip() for c in df_longest.columns]
+
+    extreme_lines = []
+    for l in lines[extreme_idx:]:
+        if not l.strip() or "전국 폭염일수" in l:
+            break
+        extreme_lines.append(l)
+    df_extreme = pd.read_csv(io.StringIO("".join(extreme_lines)))
+    df_extreme.columns = [c.strip() for c in df_extreme.columns]
+
+    df_points = pd.read_csv(io.StringIO("".join(lines[points_idx:])))
+    df_points.columns = [c.strip() for c in df_points.columns]
+    df_points = df_points.dropna(subset=["년도", "지점"])
+    df_points["년도"] = df_points["년도"].astype(int)
+
+    return df_longest, df_extreme, df_points
 
 try:
-    df = load_data()
+    geojson_raw = load_geojson(GEOJSON_URL)
+    df_longest, df_extreme, df_raw = load_all_heatwave_data()
 except Exception as e:
-    st.error(f"\u26a0\ufe0f 데이터 파일을 불러오는 중 오류가 발생했습니다: {e}")
+    st.error(f"데이터를 불러오는 중 오류가 발생했습니다: {e}")
     st.stop()
 
-st.sidebar.header("\U0001f50d 검색 설정")
-sido_list = sorted(df[SIDO_COL].dropna().unique())
-selected_sido = st.sidebar.selectbox("1\ufe0f\u20e3 지역(시/도) 선택", sido_list)
+STATION_TO_SIGUNGU = {
+    "강릉": "강릉시", "강화": "강화군", "거제": "거제시", "거창": "거창군",
+    "고흥": "고흥군", "광주": "광주", "구미": "구미시", "군산": "군산시",
+    "금산": "금산군", "남원": "남원시", "남해": "남해군", "대관령": "평창군",
+    "대구": "대구", "대전": "대전", "목포": "목포시", "문경": "문경시",
+    "밀양": "밀양시", "보령": "보령시", "보은": "보은군", "봉화": "봉화군",
+    "부산": "부산", "부안": "부안군", "부여": "부여군", "산청": "산청군",
+    "서산": "서산시", "서울": "서울", "속초": "속초시", "수원": "수원시",
+    "안동": "안동시", "양평": "양평군", "여수": "여수시", "영덕": "영덕군",
+    "영주": "영주시", "영천": "영천시", "완도": "완도군", "울산": "울산",
+    "울진": "울진군", "원주": "원주시", "의성": "의성군", "이천": "이천시",
+    "인제": "인제군", "인천": "인천", "임실": "임실군", "장수": "장수군",
+    "장흥": "장흥군", "전주": "전주시", "정읍": "정읍시", "제천": "제천시",
+    "진주": "진주시", "창원": "창원시", "천안": "천안시", "철원": "철원군",
+    "청주": "청주시", "추풍령": "영동군", "춘천": "춘천시", "충주": "충주시",
+    "태백": "태백시", "통영": "통영시", "포항": "포항시", "합천": "합천군",
+    "해남": "해남군", "홍천": "홍천군",
+}
 
-view_df = df[df[SIDO_COL] == selected_sido].copy()
+st.sidebar.header("\U0001f50d 조회 옵션")
+years = sorted(df_raw["년도"].unique())
+selected_year = st.sidebar.select_slider("\U0001f4c5 지도 조회 연도 선택", options=years, value=years[-1])
 
-st.sidebar.markdown("---")
-use_radius = st.sidebar.checkbox("2\ufe0f\u20e3 반경 검색 사용하기 (특정 매장 기준)")
+df_year = df_raw[df_raw["년도"] == selected_year]
+df_counts = df_year.groupby("지점").size().reset_index(name="폭염일수")
+df_counts["시군구"] = df_counts["지점"].map(STATION_TO_SIGUNGU)
 
-if use_radius and not view_df.empty:
-    store_names = sorted(view_df[STORE_NAME_COL].dropna().unique())
-    center_store = st.sidebar.selectbox("기준 매장 선택", store_names)
-    radius_km = st.sidebar.slider("검색 반경 (km)", min_value=0.5, max_value=10.0, value=3.0, step=0.5)
+if not df_counts.empty:
+    max_row = df_counts.sort_values(by="폭염일수", ascending=False).iloc[0]
+    avg_val = df_counts["폭염일수"].mean()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("전국 평균 폭염일수", f"{avg_val:.1f}일")
+    m2.metric("최다 폭염 관측지", f"{max_row['지점']} ({max_row['폭염일수']}일)")
+    m3.metric("관측 지점 수", f"{len(df_counts)}개 지역")
 
-    center_row = view_df[view_df[STORE_NAME_COL] == center_store].iloc[0]
-    center_lat = center_row[LAT_COL]
-    center_lon = center_row[LON_COL]
+geojson_display = copy.deepcopy(geojson_raw)
+heatwave_map = dict(zip(df_counts["시군구"], df_counts["폭염일수"]))
+for feature in geojson_display["features"]:
+    sigungu = feature["properties"].get("시군구", "")
+    val = heatwave_map.get(sigungu)
+    feature["properties"]["폭염일수"] = f"{val}일" if val is not None else "관측소 없음"
 
-    def calc_distance(lat1, lon1, lat2, lon2):
-        # 하버사인 공식: 지구가 둥글다는 것을 감안해 두 좌표 사이의 실제 거리(km)를 계산
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-        c = 2 * np.arcsin(np.sqrt(a))
-        return 6371 * c
+st.subheader(f"\U0001f5fa\ufe0f {selected_year}년 전국 폭염일수 지도")
+m = folium.Map(location=[36.0, 127.8], zoom_start=7, tiles="CartoDB positron")
 
-    view_df["거리(km)"] = calc_distance(center_lat, center_lon, view_df[LAT_COL], view_df[LON_COL])
-    view_df = view_df[view_df["거리(km)"] <= radius_km]
+min_val, max_val = float(df_counts["폭염일수"].min()), float(df_counts["폭염일수"].max())
+bins = [min_val - 1.0, min_val, min_val + 1.0] if min_val == max_val else \
+    [round(min_val + i * (max_val - min_val) / 5.0, 1) for i in range(6)]
 
-subhead_text = f"\U0001f4ca {selected_sido} 업종별 현황"
-if use_radius:
-    subhead_text += f" (기준 매장 반경 {radius_km}km 이내)"
-st.subheader(subhead_text)
+folium.Choropleth(
+    geo_data=geojson_display, data=df_counts, columns=["시군구", "폭염일수"],
+    key_on="feature.properties.시군구", fill_color="YlOrRd", fill_opacity=0.78,
+    line_color="white", line_weight=1.0, legend_name=f"{selected_year}년 폭염일수 (일)",
+    bins=bins, nan_fill_color="#f8fafc",
+).add_to(m)
 
-conv_count = (view_df[CATEGORY_COL] == NAME_CONVENIENCE).sum()
-cafe_count = (view_df[CATEGORY_COL] == NAME_CAFE).sum()
+folium.GeoJson(
+    geojson_display,
+    style_function=lambda x: {"fillColor": "#00000000", "color": "#00000000", "weight": 0},
+    tooltip=folium.GeoJsonTooltip(fields=["시도", "시군구", "폭염일수"], aliases=["시도:", "시군구:", "폭염일수:"]),
+).add_to(m)
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric(label="\U0001f3ea 편의점 수", value=f"{conv_count:,}개")
-with col2:
-    st.metric(label="\u2615 카페 수", value=f"{cafe_count:,}개")
-with col3:
-    st.metric(label="\U0001f4cc 전체 매장 수", value=f"{(conv_count + cafe_count):,}개")
+st_folium(m, width="100%", height=600, key=f"heatwave_map_{selected_year}", returned_objects=[])
 
 st.divider()
+st.subheader(f"\U0001f4ca {selected_year}년 폭염일수 순위")
+col1, col2 = st.columns(2)
+top10 = df_counts.sort_values("폭염일수", ascending=False).head(10)[["지점", "시군구", "폭염일수"]].reset_index(drop=True)
+bottom10 = df_counts.sort_values("폭염일수", ascending=True).head(10)[["지점", "시군구", "폭염일수"]].reset_index(drop=True)
+with col1:
+    st.markdown("#### \U0001f525 폭염 많은 상위 10곳")
+    st.dataframe(top10, use_container_width=True)
+with col2:
+    st.markdown("#### \U0001f9ca 폭염 적은 하위 10곳")
+    st.dataframe(bottom10, use_container_width=True)
 
-if not view_df.empty:
-    if use_radius:
-        center_dict = {"lat": center_lat, "lon": center_lon}
-        zoom_level = 13
-    else:
-        center_dict = {"lat": view_df[LAT_COL].mean(), "lon": view_df[LON_COL].mean()}
-        zoom_level = 11
-
-    color_map = {NAME_CONVENIENCE: "#1f77b4", NAME_CAFE: "#ff7f0e"}
-
-    hover_info = {LAT_COL: False, LON_COL: False, CATEGORY_COL: True}
-    if use_radius:
-        hover_info["거리(km)"] = ":.2f"
-
-    # 최신 Plotly(scatter_map) / 구버전(scatter_mapbox) 모두 호환되게 분기 처리
-    if hasattr(px, "scatter_map"):
-        fig = px.scatter_map(
-            view_df, lat=LAT_COL, lon=LON_COL, color=CATEGORY_COL,
-            color_discrete_map=color_map, hover_name=STORE_NAME_COL,
-            hover_data=hover_info, zoom=zoom_level, center=center_dict,
-            map_style="open-street-map", height=650,
-        )
-    else:
-        fig = px.scatter_mapbox(
-            view_df, lat=LAT_COL, lon=LON_COL, color=CATEGORY_COL,
-            color_discrete_map=color_map, hover_name=STORE_NAME_COL,
-            hover_data=hover_info, zoom=zoom_level, center=center_dict,
-            mapbox_style="open-street-map", height=650,
-        )
-
-    fig.update_layout(
-        margin={"r": 0, "t": 10, "l": 0, "b": 0},
-        legend_title_text="업종 구분",
-        legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.01),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.warning("선택한 조건에 맞는 매장 데이터가 없습니다.")
+st.divider()
+st.markdown("#### 가장 긴 폭염")
+st.dataframe(df_longest, use_container_width=True, hide_index=True)
+st.markdown("#### 가장 빠른/늦은 폭염")
+st.dataframe(df_extreme, use_container_width=True, hide_index=True)
